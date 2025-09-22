@@ -1,1045 +1,672 @@
 #!/bin/bash
-
-set -euo pipefail
-
-# Constants
-readonly SCRIPT_NAME="MTProxy Auto-Healing Installer"
-readonly SCRIPT_VERSION="2.1.0"
-
-# Fix for BASH_SOURCE issue when piped to bash
-if [[ "${BASH_SOURCE[0]:-}" ]]; then
-    readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-else
-    readonly SCRIPT_DIR="$(pwd)"
-fi
-
-readonly MT_PROXY_DIR="/opt/MTProxy"
-readonly CONFIG_FILE="${MT_PROXY_DIR}/objs/bin/mtconfig.conf"
-readonly SERVICE_FILE="/etc/systemd/system/MTProxy.service"
-readonly MONITOR_SCRIPT="/usr/local/bin/mtproxy-monitor.sh"
-readonly MONITOR_SERVICE="/etc/systemd/system/mtproxy-monitor.service"
-readonly MONITOR_LOG="/var/log/mtproxy-monitor.log"
-
-# Colors
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
-
-# Configuration
-declare -a SECRET_ARRAY=()
-declare -i PORT=443
-declare -i CPU_CORES=1
-declare TAG=""
-declare TLS_DOMAIN="www.cloudflare.com"
-declare CUSTOM_ARGS=""
-declare PUBLIC_IP=""
-declare PRIVATE_IP=""
-declare HAVE_NAT="n"
-declare ENABLE_UPDATER="y"
-declare ENABLE_BBR="y"
-declare AUTO_INSTALL=false
-
-# Monitoring Configuration
-declare ENABLE_MONITORING="y"
-declare -i MAX_PIDS=1000
-declare -i MAX_MEMORY_PERCENT=80
-declare -i MAX_CPU_PERCENT=90
-declare -i CHECK_INTERVAL=300
-declare -i MAX_RESTARTS=3
-declare -i RESTART_WINDOW=3600
-
-# Logging functions
-log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
-# Utility functions
-is_root() {
-    [[ $EUID -eq 0 ]]
+function GetRandomPort() {
+	if ! [ "$INSTALLED_LSOF" == true ]; then
+		echo "Installing lsof package. Please wait."
+		if [[ $distro =~ "CentOS" ]]; then
+			yum -y -q install lsof
+		elif [[ $distro =~ "Ubuntu" ]] || [[ $distro =~ "Debian" ]]; then
+			apt-get -y install lsof >/dev/null
+		fi
+		local RETURN_CODE
+		RETURN_CODE=$?
+		if [ $RETURN_CODE -ne 0 ]; then
+			echo "$(tput setaf 3)Warning!$(tput sgr 0) lsof package did not installed successfully. The randomized port may be in use."
+		else
+			INSTALLED_LSOF=true
+		fi
+	fi
+	PORT=$((RANDOM % 16383 + 49152))
+	if lsof -Pi :$PORT -sTCP:LISTEN -t >/dev/null; then
+		GetRandomPort
+	fi
 }
-
-get_distribution() {
-    if [[ -f /etc/centos-release ]]; then
-        echo "CentOS"
-    elif [[ -f /etc/debian_version ]]; then
-        echo "Debian"
-    elif [[ -f /etc/lsb-release ]] && grep -q "Ubuntu" /etc/lsb-release; then
-        echo "Ubuntu"
-    else
-        echo "Unknown"
-    fi
-}
-
-validate_port() {
-    local port="$1"
-    local regex='^[0-9]+$'
-    
-    if ! [[ "$port" =~ $regex ]]; then
-        log_error "Port must be a number"
-        return 1
-    fi
-    
-    if (( port < 1 || port > 65535 )); then
-        log_error "Port must be between 1 and 65535"
-        return 1
-    fi
-    
-    return 0
-}
-
-validate_secret() {
-    local secret="$1"
-    if ! [[ "$secret" =~ ^[0-9a-f]{32}$ ]]; then
-        log_error "Secret must be 32 hexadecimal characters"
-        return 1
-    fi
-    return 0
-}
-
-get_random_port() {
-    local port
-    while true; do
-        port=$((RANDOM % 16383 + 49152))
-        if ! command -v nc &>/dev/null || ! nc -z localhost "$port" &>/dev/null; then
-            echo "$port"
-            break
-        fi
-    done
-}
-
-get_public_ip() {
-    curl -sf --connect-timeout 5 https://api.ipify.org || echo "YOUR_IP"
-}
-
-get_private_ip() {
-    ip -4 addr show scope global | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1
-}
-
-check_nat() {
-    local private_ip
-    private_ip=$(get_private_ip)
-    
-    if [[ "$private_ip" =~ ^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168) ]]; then
-        echo "y"
-    else
-        echo "n"
-    fi
-}
-
-# Monitoring functions
-get_service_pids() {
-    local pid_count
-    pid_count=$(pgrep -f "mtproto-proxy" | wc -l 2>/dev/null || echo "0")
-    echo "$pid_count"
-}
-
-get_service_memory() {
-    local memory_percent
-    memory_percent=$(ps -C mtproto-proxy -o %mem --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0")
-    echo "${memory_percent%.*}"
-}
-
-get_service_cpu() {
-    local cpu_percent
-    cpu_percent=$(ps -C mtproto-proxy -o %cpu --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0")
-    echo "${cpu_percent%.*}"
-}
-
-is_service_running() {
-    systemctl is-active --quiet MTProxy
-}
-
-get_restart_count() {
-    local window_start
-    window_start=$(date -d "1 hour ago" +%s 2>/dev/null || echo "0")
-    journalctl -u MTProxy --since="@$window_start" 2>/dev/null | grep -c "Stopped\|failed\|restart" || echo "0"
-}
-
-create_monitor_script() {
-    log_info "Creating monitoring script..."
-    
-    cat > "$MONITOR_SCRIPT" << 'EOF'
-#!/bin/bash
-set -euo pipefail
-
-# Configuration
-MAX_PIDS=1000
-MAX_MEMORY_PERCENT=80
-MAX_CPU_PERCENT=90
-CHECK_INTERVAL=300
-MAX_RESTARTS=3
-LOG_FILE="/var/log/mtproxy-monitor.log"
-
-# Logging
-log() {
-    echo "$(date): $1" >> "$LOG_FILE"
-    logger -t "mtproxy-monitor" "$1"
-}
-
-# Monitoring functions
-get_service_pids() {
-    pgrep -f "mtproto-proxy" | wc -l 2>/dev/null || echo "0"
-}
-
-get_service_memory() {
-    ps -C mtproto-proxy -o %mem --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0"
-}
-
-get_service_cpu() {
-    ps -C mtproto-proxy -o %cpu --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0"
-}
-
-is_service_running() {
-    systemctl is-active --quiet MTProxy
-}
-
-get_restart_count() {
-    local window_start
-    window_start=$(date -d "1 hour ago" +%s 2>/dev/null || echo "0")
-    journalctl -u MTProxy --since="@$window_start" 2>/dev/null | grep -c "Stopped\|failed\|restart" || echo "0"
-}
-
-check_resource_usage() {
-    local pids memory cpu
-    
-    pids=$(get_service_pids)
-    memory=$(get_service_memory)
-    cpu=$(get_service_cpu)
-    
-    log "Resource Check - PIDs: $pids/$MAX_PIDS, Memory: ${memory}%/${MAX_MEMORY_PERCENT}%, CPU: ${cpu}%/${MAX_CPU_PERCENT}%"
-    
-    if (( pids > MAX_PIDS )) || (( memory > MAX_MEMORY_PERCENT )) || (( cpu > MAX_CPU_PERCENT )); then
-        return 1
-    fi
-    return 0
-}
-
-safe_restart_service() {
-    log "Resource limits exceeded. Attempting safe restart..."
-    systemctl restart MTProxy
-    sleep 15
-}
-
-emergency_reboot() {
-    local reason="$1"
-    log "EMERGENCY: $reason - Too many restarts, scheduling reboot"
-    echo "MTProxy Monitor: Emergency reboot due to $reason" | wall
-    shutdown -r +2 "MTProxy emergency reboot"
-}
-
-# Main monitor function
-main_check() {
-    # Check if service is running
-    if ! is_service_running; then
-        log "Service is not running. Starting..."
-        systemctl start MTProxy
-        sleep 10
-        return
-    fi
-    
-    # Check resource usage
-    if ! check_resource_usage; then
-        local restart_count
-        restart_count=$(get_restart_count)
-        
-        log "High resource usage detected. Restart count: $restart_count/$MAX_RESTARTS"
-        
-        if (( restart_count >= MAX_RESTARTS )); then
-            emergency_reboot "excessive restarts"
-            return
-        fi
-        
-        safe_restart_service
-        
-        # Verify restart was successful
-        sleep 10
-        if ! is_service_running; then
-            log "Service failed to start after restart"
-        fi
-    fi
-}
-
-# Load custom configuration if exists
-if [[ -f /etc/mtproxy/monitor.conf ]]; then
-    source /etc/mtproxy/monitor.conf
-fi
-
-# Main loop
-while true; do
-    main_check
-    sleep "$CHECK_INTERVAL"
-done
-EOF
-
-    chmod +x "$MONITOR_SCRIPT"
-    log_success "Monitoring script created: $MONITOR_SCRIPT"
-}
-
-create_monitor_service() {
-    log_info "Creating monitoring service..."
-    
-    cat > "$MONITOR_SERVICE" << EOF
-[Unit]
-Description=MTProxy Resource Monitor
-After=MTProxy.service
-Wants=MTProxy.service
-
-[Service]
-Type=simple
-ExecStart=$MONITOR_SCRIPT
-Restart=always
-RestartSec=10
-User=root
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    log_success "Monitoring service file created: $MONITOR_SERVICE"
-}
-
-setup_monitoring() {
-    if [[ "$ENABLE_MONITORING" != "y" ]]; then
-        return 0
-    fi
-    
-    log_info "Setting up resource monitoring system..."
-    
-    # Create monitor script
-    create_monitor_script
-    
-    # Create monitor service
-    create_monitor_service
-    
-    # Create configuration file
-    mkdir -p /etc/mtproxy
-    cat > /etc/mtproxy/monitor.conf << EOF
-# MTProxy Monitor Configuration
-MAX_PIDS=$MAX_PIDS
-MAX_MEMORY_PERCENT=$MAX_MEMORY_PERCENT
-MAX_CPU_PERCENT=$MAX_CPU_PERCENT
-CHECK_INTERVAL=$CHECK_INTERVAL
-MAX_RESTARTS=$MAX_RESTARTS
-EOF
-
-    # Enable and start monitoring service
-    systemctl daemon-reload
-    systemctl enable mtproxy-monitor
-    systemctl start mtproxy-monitor
-    
-    if systemctl is-active --quiet mtproxy-monitor; then
-        log_success "Resource monitoring service started successfully"
-    else
-        log_error "Failed to start monitoring service"
-        systemctl status mtproxy-monitor
-    fi
-}
-
-# Installation functions
-install_dependencies() {
-    local distro="$1"
-    
-    log_info "Installing dependencies for $distro..."
-    
-    case "$distro" in
-        "CentOS")
-            yum -y install epel-release
-            yum -y install openssl-devel zlib-devel curl ca-certificates sed cronie vim-common git curl gcc make
-            ;;
-        "Ubuntu"|"Debian")
-            apt-get update
-            apt-get -y install git curl build-essential libssl-dev zlib1g-dev sed cron ca-certificates
-            ;;
-        *)
-            log_error "Unsupported distribution: $distro"
-            return 1
-            ;;
-    esac
-}
-
-install_mtproxy() {
-    log_info "Installing MTProxy..."
-    
-    if [[ -d "$MT_PROXY_DIR" ]]; then
-        log_warning "MTProxy directory already exists. Removing..."
-        rm -rf "$MT_PROXY_DIR"
-    fi
-    
-    cd /opt || exit 1
-    git clone -b gcc10 https://github.com/krepver/MTProxy.git
-    cd MTProxy || exit 1
-    
-    if ! make; then
-        log_error "Failed to build MTProxy"
-        exit 1
-    fi
-    
-    log_success "MTProxy built successfully"
-}
-
-download_configs() {
-    log_info "Downloading proxy configuration files..."
-    
-    cd "${MT_PROXY_DIR}/objs/bin" || exit 1
-    
-    if ! curl -sf https://core.telegram.org/getProxySecret -o proxy-secret; then
-        log_error "Failed to download proxy-secret"
-    else
-        log_success "Proxy secret downloaded"
-    fi
-    
-    if ! curl -sf https://core.telegram.org/getProxyConfig -o proxy-multi.conf; then
-        log_error "Failed to download proxy-multi.conf"
-    else
-        log_success "Proxy config downloaded"
-    fi
-}
-
-configure_firewall() {
-    local port="$1"
-    local distro="$2"
-    
-    log_info "Configuring firewall for port $port..."
-    
-    case "$distro" in
-        "CentOS")
-            if command -v firewall-cmd &>/dev/null; then
-                firewall-cmd --zone=public --add-port="${port}/tcp" --permanent
-                firewall-cmd --reload
-                log_success "Firewall configured for port $port"
-            else
-                log_warning "firewalld not installed. Skipping firewall configuration."
-            fi
-            ;;
-        "Ubuntu")
-            if command -v ufw &>/dev/null; then
-                ufw allow "${port}/tcp"
-                log_success "Firewall configured for port $port"
-            else
-                log_warning "UFW not installed. Skipping firewall configuration."
-            fi
-            ;;
-        "Debian")
-            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-            if command -v iptables-save &>/dev/null; then
-                iptables-save > /etc/iptables/rules.v4
-                log_success "Firewall configured for port $port"
-            fi
-            ;;
-    esac
-}
-
-enable_bbr() {
-    local distro="$1"
-    
-    if [[ "$ENABLE_BBR" != "y" ]]; then
-        return 0
-    fi
-    
-    log_info "Enabling BBR congestion control..."
-    
-    if [[ "$distro" =~ ^(Ubuntu|Debian)$ ]]; then
-        if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-            echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        fi
-        if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        fi
-        sysctl -p >/dev/null 2>&1
-        log_success "BBR enabled"
-    else
-        log_warning "BBR auto-configuration not supported on $distro"
-    fi
-}
-
-create_config_file() {
-    log_info "Creating configuration file..."
-    
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    cat > "$CONFIG_FILE" << EOF
-# MTProxy Configuration
-PORT=$PORT
-CPU_CORES=$CPU_CORES
-SECRET_ARRAY=(${SECRET_ARRAY[*]})
-TAG="$TAG"
-CUSTOM_ARGS="$CUSTOM_ARGS"
-TLS_DOMAIN="$TLS_DOMAIN"
-HAVE_NAT="$HAVE_NAT"
-PUBLIC_IP="$PUBLIC_IP"
-PRIVATE_IP="$PRIVATE_IP"
-ENABLE_UPDATER="$ENABLE_UPDATER"
-ENABLE_MONITORING="$ENABLE_MONITORING"
-MAX_PIDS=$MAX_PIDS
-MAX_MEMORY_PERCENT=$MAX_MEMORY_PERCENT
-MAX_CPU_PERCENT=$MAX_CPU_PERCENT
-CHECK_INTERVAL=$CHECK_INTERVAL
-EOF
-}
-
-generate_service_file() {
-    local args="-u nobody -H $PORT"
-    
-    for secret in "${SECRET_ARRAY[@]}"; do
-        args+=" -S $secret"
-    done
-    
-    [[ -n "$TAG" ]] && args+=" -P $TAG"
-    [[ -n "$TLS_DOMAIN" ]] && args+=" -D $TLS_DOMAIN"
-    [[ "$HAVE_NAT" == "y" ]] && args+=" --nat-info $PRIVATE_IP:$PUBLIC_IP"
-    
-    local core_count=$((CPU_CORES - 1))
-    args+=" -M $core_count $CUSTOM_ARGS --aes-pwd proxy-secret proxy-multi.conf"
-    
-    cat > "$SERVICE_FILE" << EOF
-[Unit]
+function GenerateService() {
+	local ARGS_STR
+	ARGS_STR="-u nobody -H $PORT"
+	for i in "${SECRET_ARY[@]}"; do # Add secrets
+		ARGS_STR+=" -S $i"
+	done
+	if [ -n "$TAG" ]; then
+		ARGS_STR+=" -P $TAG "
+	fi
+	if [ -n "$TLS_DOMAIN" ]; then
+		ARGS_STR+=" -D $TLS_DOMAIN "
+	fi
+	if [ "$HAVE_NAT" == "y" ]; then
+		ARGS_STR+=" --nat-info $PRIVATE_IP:$PUBLIC_IP "
+	fi
+	NEW_CORE=$((CPU_CORES - 1))
+	ARGS_STR+=" -M $NEW_CORE $CUSTOM_ARGS --aes-pwd proxy-secret proxy-multi.conf"
+	SERVICE_STR="[Unit]
 Description=MTProxy
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${MT_PROXY_DIR}/objs/bin
-ExecStart=${MT_PROXY_DIR}/objs/bin/mtproto-proxy $args
+WorkingDirectory=/opt/MTProxy/objs/bin
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy $ARGS_STR
 Restart=on-failure
-RestartSec=10
-StartLimitBurst=3
-StartLimitInterval=60
+StartLimitBurst=0
 
 [Install]
-WantedBy=multi-user.target
-EOF
+WantedBy=multi-user.target"
 }
+#User must run the script as root
+if [[ "$EUID" -ne 0 ]]; then
+	echo "Please run this script as root"
+	exit 1
+fi
+regex='^[0-9]+$'
+distro=$(awk -F= '/^NAME/{print $2}' /etc/os-release)
+clear
+if [ -d "/opt/MTProxy" ]; then
+	echo "You have already installed MTProxy! What do you want to do?"
+	echo "  1 ) Show connection links"
+	echo "  2 ) Change TAG"
+	echo "  3 ) Add a secret"
+	echo "  4 ) Revoke a secret"
+	echo "  5 ) Change Worker Numbers"
+	echo "  6 ) Change NAT settings"
+	echo "  7 ) Change Custom Arguments"
+	echo "  8 ) Generate Firewall Rules"
+	echo "  9 ) Uninstall Proxy"
+	echo "  10) About"
+	echo "  *) Exit"
+	read -r -p "Please enter a number: " OPTION
+	source /opt/MTProxy/objs/bin/mtconfig.conf #Load Configs
+	case $OPTION in
+	#Show connections
+	1)
+		clear
+		echo "$(tput setaf 3)Getting your IP address.$(tput sgr 0)"
+		PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+		CURL_EXIT_STATUS=$?
+		if [ $CURL_EXIT_STATUS -ne 0 ]; then
+			PUBLIC_IP="YOUR_IP"
+		fi
+		HEX_DOMAIN=$(printf "%s" "$TLS_DOMAIN" | xxd -pu)
+		HEX_DOMAIN="$(echo $HEX_DOMAIN | tr '[A-Z]' '[a-z]')"
+		for i in "${SECRET_ARY[@]}"; do
+			if [ -z "$TLS_DOMAIN" ]; then
+				echo "tg://proxy?server=$PUBLIC_IP&port=$PORT&secret=dd$i"
+			else
+				echo "tg://proxy?server=$PUBLIC_IP&port=$PORT&secret=ee$i$HEX_DOMAIN"
+			fi
+		done
+		;;
+	#Change TAG
+	2)
+		if [ -z "$TAG" ]; then
+			echo "It looks like your AD TAG is empty. Get the AD TAG at https://t.me/mtproxybot and enter it here:"
+		else
+			echo "Current tag is $TAG. If you want to remove it, just press enter. Otherwise type the new TAG:"
+		fi
+		read -r TAG
+		cd /etc/systemd/system || exit 2
+		systemctl stop MTProxy
+		GenerateService
+		echo "$SERVICE_STR" >MTProxy.service
+		systemctl daemon-reload
+		systemctl start MTProxy
+		cd /opt/MTProxy/objs/bin/ || exit 2
+		sed -i "s/^TAG=.*/TAG=\"$TAG\"/" mtconfig.conf
+		echo "Done"
+		;;
+	#Add secret
+	3)
+		if [ "${#SECRET_ARY[@]}" -ge 16 ]; then
+			echo "$(tput setaf 1)Error$(tput sgr 0) You cannot have more than 16 secrets"
+			exit 1
+		fi
+		echo "Do you want to set secret manually or shall I create a random secret?"
+		echo "   1) Manually enter a secret"
+		echo "   2) Create a random secret"
+		read -r -p "Please select one [1-2]: " -e -i 2 OPTION
+		case $OPTION in
+		1)
+			echo "Enter a 32 character string filled by 0-9 and a-f(hexadecimal): "
+			read -r SECRET
+			#Validate length
+			SECRET="$(echo $SECRET | tr '[A-Z]' '[a-z]')"
+			if ! [[ $SECRET =~ ^[0-9a-f]{32}$ ]]; then
+				echo "$(tput setaf 1)Error:$(tput sgr 0) Enter hexadecimal characters and secret must be 32 characters."
+				exit 1
+			fi
+			;;
+		2)
+			SECRET="$(hexdump -vn "16" -e ' /1 "%02x"' /dev/urandom)"
+			echo "OK I created one: $SECRET"
+			;;
+		*)
+			echo "$(tput setaf 1)Invalid option$(tput sgr 0)"
+			exit 1
+			;;
+		esac
+		SECRET_ARY+=("$SECRET")
+		#Add secret to config
+		cd /etc/systemd/system || exit 2
+		systemctl stop MTProxy
+		GenerateService
+		echo "$SERVICE_STR" >MTProxy.service
+		systemctl daemon-reload
+		systemctl start MTProxy
+		cd /opt/MTProxy/objs/bin/ || exit 2
+		SECRET_ARY_STR=${SECRET_ARY[*]}
+		sed -i "s/^SECRET_ARY=.*/SECRET_ARY=($SECRET_ARY_STR)/" mtconfig.conf
+		echo "Done"
+		PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+		CURL_EXIT_STATUS=$?
+		if [ $CURL_EXIT_STATUS -ne 0 ]; then
+			PUBLIC_IP="YOUR_IP"
+		fi
+		echo
+		echo "You can now connect to your server with this secret with this link:"
+		echo "tg://proxy?server=$PUBLIC_IP&port=$PORT&secret=dd$SECRET"
+		;;
+	#Revoke Secret
+	4)
+		NUMBER_OF_SECRETS=${#SECRET_ARY[@]}
+		if [ "$NUMBER_OF_SECRETS" -le 1 ]; then
+			echo "Cannot remove the last secret."
+			exit 1
+		fi
+		echo "Select a secret to revoke:"
+		COUNTER=1
+		for i in "${SECRET_ARY[@]}"; do
+			echo "  $COUNTER) $i"
+			COUNTER=$((COUNTER + 1))
+		done
+		read -r -p "Select a user by it's index to revoke: " USER_TO_REVOKE
+		if ! [[ $USER_TO_REVOKE =~ $regex ]]; then
+			echo "$(tput setaf 1)Error:$(tput sgr 0) The input is not a valid number"
+			exit 1
+		fi
+		if [ "$USER_TO_REVOKE" -lt 1 ] || [ "$USER_TO_REVOKE" -gt "$NUMBER_OF_SECRETS" ]; then
+			echo "$(tput setaf 1)Error:$(tput sgr 0) Invalid number"
+			exit 1
+		fi
+		USER_TO_REVOKE1=$((USER_TO_REVOKE - 1))
+		SECRET_ARY=("${SECRET_ARY[@]:0:$USER_TO_REVOKE1}" "${SECRET_ARY[@]:$USER_TO_REVOKE}")
+		cd /etc/systemd/system || exit 2
+		systemctl stop MTProxy
+		GenerateService
+		echo "$SERVICE_STR" >MTProxy.service
+		systemctl daemon-reload
+		systemctl start MTProxy
+		cd /opt/MTProxy/objs/bin/ || exit 2 || exit 2
+		SECRET_ARY_STR=${SECRET_ARY[*]}
+		sed -i "s/^SECRET_ARY=.*/SECRET_ARY=($SECRET_ARY_STR)/" mtconfig.conf
+		echo "Done"
+		;;	
+	#Change CPU workers
+	5)
+		CPU_CORES=$(nproc --all)
+		echo "I've detected that your server has $CPU_CORES cores. If you want I can configure proxy to run at all of your cores. This will make the proxy to spawn $CPU_CORES workers. For some reasons, proxy will most likely to fail at more than 16 cores. So please choose a number between 1 and 16."
+		read -r -p "Who many workers you want proxy to spawn? " -e -i "$CPU_CORES" CPU_CORES
+		if ! [[ $CPU_CORES =~ $regex ]]; then #Check if input is number
+			echo "$(tput setaf 1)Error:$(tput sgr 0) The input is not a valid number"
+			exit 1
+		fi
+		if [ "$CPU_CORES" -lt 1 ]; then #Check range of workers
+			echo "$(tput setaf 1)Error:$(tput sgr 0) Enter number more than 1."
+			exit 1
+		fi
+		if [ "$CPU_CORES" -gt 16 ]; then
+			echo "(tput setaf 3)Warning:$(tput sgr 0) Values more than 16 can cause some problems later. Proceed at your own risk."
+		fi
+		#Save
+		cd /etc/systemd/system || exit 2
+		systemctl stop MTProxy
+		GenerateService
+		echo "$SERVICE_STR" >MTProxy.service
+		systemctl daemon-reload
+		systemctl start MTProxy
+		cd /opt/MTProxy/objs/bin/ || exit 2
+		sed -i "s/^CPU_CORES=.*/CPU_CORES=$CPU_CORES/" mtconfig.conf
+		echo "Done"
+		;;
+	#Change NAT types
+	6)
+		#Try to autodetect private ip: https://github.com/angristan/openvpn-install/blob/master/openvpn-install.sh#L230
+		IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+		HAVE_NAT="n"
+		if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+			HAVE_NAT="y"
+		fi
+		read -r -p "Is your server behind NAT? (You probably need this if you are using AWS)(y/n) " -e -i "$HAVE_NAT" HAVE_NAT
+		if [[ "$HAVE_NAT" == "y" || "$HAVE_NAT" == "Y" ]]; then
+			PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+			read -r -p "Please enter your public IP: " -e -i "$PUBLIC_IP" PUBLIC_IP
+			if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+				echo "I have detected that $IP is your private IP address. Please verify it."
+			else
+				IP=""
+			fi
+			read -r -p "Please enter your private IP: " -e -i "$IP" PRIVATE_IP
+		fi
+		cd /opt/MTProxy/objs/bin/ || exit 2
+		sed -i "s/^HAVE_NAT=.*/HAVE_NAT=\"$HAVE_NAT\"/" mtconfig.conf
+		sed -i "s/^PUBLIC_IP=.*/PUBLIC_IP=\"$PUBLIC_IP\"/" mtconfig.conf
+		sed -i "s/^PRIVATE_IP=.*/PRIVATE_IP=\"$PRIVATE_IP\"/" mtconfig.conf
+		echo "Done"
+		;;
+	#Change other args
+	7)
+		echo "If you want to use custom arguments to run the proxy enter them here; Otherwise just press enter."
+		read -r -e -i "$CUSTOM_ARGS" CUSTOM_ARGS
+		#Save
+		cd /etc/systemd/system || exit 2
+		systemctl stop MTProxy
+		GenerateService
+		echo "$SERVICE_STR" >MTProxy.service
+		systemctl daemon-reload
+		systemctl start MTProxy
+		cd /opt/MTProxy/objs/bin/ || exit 2
+		sed -i "s/^CUSTOM_ARGS=.*/CUSTOM_ARGS=\"$CUSTOM_ARGS\"/" mtconfig.conf
+		echo "Done"
+		;;
+	#Firewall rules
+	8)
+		if [[ $distro =~ "CentOS" ]]; then
+			echo "firewall-cmd --zone=public --add-port=$PORT/tcp"
+			echo "firewall-cmd --runtime-to-permanent"
+		elif [[ $distro =~ "Ubuntu" ]]; then
+			echo "ufw allow $PORT/tcp"
+		elif [[ $distro =~ "Debian" ]]; then
+			echo "iptables -A INPUT -p tcp --dport $PORT --jump ACCEPT"
+			echo "iptables-save > /etc/iptables/rules.v4"
+		fi
+		read -r -p "Do you want to apply these rules?[y/n] " -e -i "y" OPTION
+		if [ "$OPTION" == "y" ] || [ "$OPTION" == "Y" ]; then
+			if [[ $distro =~ "CentOS" ]]; then
+				firewall-cmd --zone=public --add-port="$PORT"/tcp
+				firewall-cmd --runtime-to-permanent
+			elif [[ $distro =~ "Ubuntu" ]]; then
+				ufw allow "$PORT"/tcp
+			elif [[ $distro =~ "Debian" ]]; then
+				iptables -A INPUT -p tcp --dport "$PORT" --jump ACCEPT
+				iptables-save >/etc/iptables/rules.v4
+			fi
+		fi
+		;;
+	#Uninstall proxy
+	9)
+		read -r -p "I still keep some packages like \"Development Tools\". Do want to uninstall MTProto-Proxy?(y/n) " OPTION
+		case $OPTION in
+		"y" | "Y")
+			cd /opt/MTProxy || exit 2
+			systemctl stop MTProxy
+			systemctl disable MTProxy
+			if [[ $distro =~ "CentOS" ]]; then
+				firewall-cmd --remove-port="$PORT"/tcp
+				firewall-cmd --runtime-to-permanent
+			elif [[ $distro =~ "Ubuntu" ]]; then
+				ufw delete allow "$PORT"/tcp
+			elif [[ $distro =~ "Debian" ]]; then
+				iptables -D INPUT -p tcp --dport "$PORT" --jump ACCEPT
+				iptables-save >/etc/iptables/rules.v4
+			fi
+			rm -rf /opt/MTProxy /etc/systemd/system/MTProxy.service
+			systemctl daemon-reload
+			sed -i '\|cd /opt/MTProxy/objs/bin && bash updater.sh|d' /etc/crontab
+			if [[ $distro =~ "CentOS" ]]; then
+				systemctl restart crond
+			elif [[ $distro =~ "Ubuntu" ]] || [[ $distro =~ "Debian" ]]; then
+				systemctl restart cron
+			fi
+			echo "Ok it's done."
+			;;
+		esac
+		;;
+	# About
+	11)
+		echo "MTProtoInstaller script by Hirbod Behnam"
+		echo "Source at https://github.com/TelegramMessenger/MTProxy"
+		echo "Github repo of script: https://github.com/HirbodBehnam/MTProtoProxyInstaller"
+		;;
+	esac
+	exit
+fi
+SECRET_ARY=()
+if [ "$#" -ge 2 ]; then
+	AUTO=true
+	# Parse arguments like: https://stackoverflow.com/4213397
+	while [[ "$#" -gt 0 ]]; do
+		case $1 in
+			-s|--secret) SECRET_ARY+=("$2"); shift ;;
+		 	-p|--port) PORT=$2; shift ;;
+			-t|--tag) TAG=$2; shift ;;
+			--workers) CPU_CORES=$2; shift ;;
+			--disable-updater) ENABLE_UPDATER="n" ;;
+			--tls) TLS_DOMAIN="$2"; shift ;;
+			--custom-args) CUSTOM_ARGS="$2"; shift;;
+			--no-nat) HAVE_NAT="n" ;;
+			--no-bbr) ENABLE_BBR="n" ;;
+		esac
+		shift
+	done
+	#Check secret
+	if [[ ${#SECRET_ARY[@]} -eq 0 ]];then
+		echo "$(tput setaf 1)Error:$(tput sgr 0) Please enter at least one secret"
+		exit 1
+	fi
+	for i in "${SECRET_ARY[@]}"; do
+		if ! [[ $i =~ ^[0-9a-f]{32}$ ]]; then
+			echo "$(tput setaf 1)Error:$(tput sgr 0) Enter hexadecimal characters and secret must be 32 characters. Error on secret $i"
+			exit 1
+		fi
+	done
+	#Check port
+	if [ -z ${PORT+x} ]; then #Check random port
+		GetRandomPort
+		echo "I've selected $PORT as your port."
+	fi
+	if ! [[ $PORT =~ $regex ]]; then #Check if the port is valid
+		echo "$(tput setaf 1)Error:$(tput sgr 0) The input is not a valid number"
+		exit 1
+	fi
+	if [ "$PORT" -gt 65535 ]; then
+		echo "$(tput setaf 1)Error:$(tput sgr 0): Number must be less than 65536"
+		exit 1
+	fi
+	#Check NAT
+	if [[ "$HAVE_NAT" != "n" ]]; then
+		PRIVATE_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+		PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+		HAVE_NAT="n"
+		if echo "$PRIVATE_IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+			HAVE_NAT="y"
+		fi
+	fi
+	#Check other stuff
+	if [ -z ${CPU_CORES+x} ]; then CPU_CORES=$(nproc --all); fi
+	if [ -z ${ENABLE_UPDATER+x} ]; then ENABLE_UPDATER="y"; fi
+	if [ -z ${TLS_DOMAIN+x} ]; then TLS_DOMAIN="www.cloudflare.com"; fi
+	if [ -z ${ENABLE_BBR+x} ]; then ENABLE_UPDATER="y"; fi
+else
+	#Variables
+	SECRET=""
+	TAG=""
+	echo "Welcome to MTProto-Proxy auto installer!"
+	echo "Created by Hirbod Behnam"
+	echo "I will install mtprotoproxy, the official repository"
+	echo "Source at https://github.com/TelegramMessenger/MTProxy and https://github.com/krepver/MTProxy"
+	echo "Github repo of script: https://github.com/HirbodBehnam/MTProtoProxyInstaller"
+	echo "Now I will gather some info from you..."
+	echo ""
+	echo ""
+	#Proxy Port
+	read -r -p "Select a port to proxy listen on it (-1 to randomize): " -e -i "443" PORT
+	if [[ $PORT -eq -1 ]]; then #Check random port
+		GetRandomPort
+		echo "I've selected $PORT as your port."
+	fi
+	if ! [[ $PORT =~ $regex ]]; then #Check if the port is valid
+		echo "$(tput setaf 1)Error:$(tput sgr 0) The input is not a valid number"
+		exit 1
+	fi
+	if [ "$PORT" -gt 65535 ]; then
+		echo "$(tput setaf 1)Error:$(tput sgr 0): Number must be less than 65536"
+		exit 1
+	fi
+	while true; do
+		echo "Do you want to set secret manually or shall I create a random secret?"
+		echo "   1) Manually enter a secret"
+		echo "   2) Create a random secret"
+		read -r -p "Please select one [1-2]: " -e -i 2 OPTION
+		case $OPTION in
+		1)
+			echo "Enter a 32 character string filled by 0-9 and a-f(hexadecimal): "
+			read -r SECRET
+			#Validate length
+			SECRET="$(echo $SECRET | tr '[A-Z]' '[a-z]')"
+			if ! [[ $SECRET =~ ^[0-9a-f]{32}$ ]]; then
+				echo "$(tput setaf 1)Error:$(tput sgr 0) Enter hexadecimal characters and secret must be 32 characters."
+				exit 1
+			fi
+			;;
+		2)
+			SECRET="$(hexdump -vn "16" -e ' /1 "%02x"' /dev/urandom)"
+			echo "OK I created one: $SECRET"
+			;;
+		*)
+			echo "$(tput setaf 1)Invalid option$(tput sgr 0)"
+			exit 1
+			;;
+		esac
+		SECRET_ARY+=("$SECRET")
+		read -r -p "Do you want to add another secret?(y/n) " -e -i "n" OPTION
+		case $OPTION in
+		'y' | "Y")
+			if [ "${#SECRET_ARY[@]}" -ge 16 ]; then
+				echo "$(tput setaf 1)Error$(tput sgr 0) You cannot have more than 16 secrets"
+				break
+			fi
+			;;
 
-setup_service() {
-    log_info "Setting up systemd service..."
-    
-    systemctl daemon-reload
-    systemctl enable MTProxy
-    
-    if ! systemctl start MTProxy; then
-        log_error "Failed to start MTProxy service"
-        systemctl status MTProxy
-        return 1
-    fi
-    
-    sleep 5
-    if systemctl is-active --quiet MTProxy; then
-        log_success "MTProxy service started successfully"
-    else
-        log_error "MTProxy service failed to start"
-        return 1
-    fi
-}
-
-setup_updater() {
-    if [[ "$ENABLE_UPDATER" != "y" ]]; then
-        return 0
-    fi
-    
-    log_info "Setting up automatic updater..."
-    
-    cat > "${MT_PROXY_DIR}/objs/bin/updater.sh" << 'EOF'
-#!/bin/bash
-set -euo pipefail
-
+		'n' | "N")
+			break
+			;;
+		*)
+			echo "$(tput setaf 1)Invalid option$(tput sgr 0)"
+			exit 1
+			;;
+		esac
+	done
+	#Now setup the tag
+	read -r -p "Do you want to setup the advertising tag?(y/n) " -e -i "n" OPTION
+	if [[ "$OPTION" == "y" || "$OPTION" == "Y" ]]; then
+		echo "$(tput setaf 1)Note:$(tput sgr 0) Joined users and admins won't see the channel at very top."
+		echo "On telegram, go to @MTProxybot Bot and enter this server's IP and $PORT as port. Then as secret enter $SECRET"
+		echo "Bot will give you a string named TAG. Enter it here:"
+		read -r TAG
+	fi
+	#Get CPU Cores
+	CPU_CORES=$(nproc --all)
+	echo "I've detected that your server has $CPU_CORES cores. If you want I can configure proxy to run at all of your cores. This will make the proxy to spawn $CPU_CORES workers. For some reasons, proxy will most likely to fail at more than 16 cores. So please choose a number between 1 and 16."
+	read -r -p "How many workers you want proxy to spawn? " -e -i "$CPU_CORES" CPU_CORES
+	if ! [[ $CPU_CORES =~ $regex ]]; then #Check if input is number
+		echo "$(tput setaf 1)Error:$(tput sgr 0) The input is not a valid number"
+		exit 1
+	fi
+	if [ "$CPU_CORES" -lt 1 ]; then #Check range of workers
+		echo "$(tput setaf 1)Error:$(tput sgr 0) Enter number more than 1."
+		exit 1
+	fi
+	if [ "$CPU_CORES" -gt 16 ]; then
+		echo "$(tput setaf 3)Warning:$(tput sgr 0) Values more than 16 can cause some problems later. Proceed at your own risk."
+	fi
+	#Secret and config updater
+	read -r -p "Do you want to enable the automatic config updater? I will update \"proxy-secret\" and \"proxy-multi.conf\" each day at midnight(12:00 AM). It's recommended to enable this.[y/n] " -e -i "y" ENABLE_UPDATER
+	#Change host mask
+	read -r -p "Select a host that DPI thinks you are visiting (TLS_DOMAIN). Pass an empty string to disable Fake-TLS. Enabling this option will automaticly disable the 'dd' secrets: " -e -i "www.cloudflare.com" TLS_DOMAIN
+	#Use nat status for proxies behind NAT
+	#Try to autodetect private ip: https://github.com/angristan/openvpn-install/blob/master/openvpn-install.sh#L230
+	IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+	HAVE_NAT="n"
+	if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+		HAVE_NAT="y"
+	fi
+	read -r -p "Is your server behind NAT? (You probably need this if you are using AWS)(y/n) " -e -i "$HAVE_NAT" HAVE_NAT
+	if [[ "$HAVE_NAT" == "y" || "$HAVE_NAT" == "Y" ]]; then
+		PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+		read -r -p "Please enter your public IP: " -e -i "$PUBLIC_IP" PUBLIC_IP
+		if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+			echo "I have detected that $IP is your private IP address. Please verify it."
+		else
+			IP=""
+		fi
+		read -r -p "Please enter your private IP: " -e -i "$IP" PRIVATE_IP
+	fi
+	#Other arguments
+	echo "If you want to use custom arguments to run the proxy enter them here; Otherwise just press enter."
+	read -r CUSTOM_ARGS
+	#Install
+	read -n 1 -s -r -p "Press any key to install..."
+	clear
+fi
+#Now install packages
+if [[ $distro =~ "CentOS" ]]; then
+	yum -y install epel-release
+	yum -y install openssl-devel zlib-devel curl ca-certificates sed cronie vim-common
+	yum -y groupinstall "Development Tools"
+elif [[ $distro =~ "Ubuntu" ]] || [[ $distro =~ "Debian" ]]; then
+	apt-get update
+	apt-get -y install git curl build-essential libssl-dev zlib1g-dev sed cron ca-certificates vim-common
+fi
+timedatectl set-ntp on #Make the time accurate by enabling ntp
+#Clone and build
+cd /opt || exit 2
+git clone -b gcc10 https://github.com/krepver/MTProxy.git
+cd MTProxy || exit 2
+make            #Build the proxy
+BUILD_STATUS=$? #Check if build was successful
+if [ $BUILD_STATUS -ne 0 ]; then
+	echo "$(tput setaf 1)Error:$(tput sgr 0) Build failed with exit code $BUILD_STATUS"
+	echo "Deleting the project files..."
+	rm -rf /opt/MTProxy
+	echo "Done"
+	exit 3
+fi
+cd objs/bin || exit 2
+curl -s https://core.telegram.org/getProxySecret -o proxy-secret
+STATUS_SECRET=$?
+if [ $STATUS_SECRET -ne 0 ]; then
+	echo "$(tput setaf 1)Error:$(tput sgr 0) Cannot download proxy-secret from Telegram servers."
+fi
+curl -s https://core.telegram.org/getProxyConfig -o proxy-multi.conf
+STATUS_SECRET=$?
+if [ $STATUS_SECRET -ne 0 ]; then
+	echo "$(tput setaf 1)Error:$(tput sgr 0) Cannot download proxy-multi.conf from Telegram servers."
+fi
+#Setup mtconfig.conf
+echo "PORT=$PORT" >mtconfig.conf
+echo "CPU_CORES=$CPU_CORES" >>mtconfig.conf
+echo "SECRET_ARY=(${SECRET_ARY[*]})" >>mtconfig.conf
+echo "TAG=\"$TAG\"" >>mtconfig.conf
+echo "CUSTOM_ARGS=\"$CUSTOM_ARGS\"" >>mtconfig.conf
+echo "TLS_DOMAIN=\"$TLS_DOMAIN\"" >>mtconfig.conf
+echo "HAVE_NAT=\"$HAVE_NAT\"" >>mtconfig.conf
+echo "PUBLIC_IP=\"$PUBLIC_IP\"" >>mtconfig.conf
+echo "PRIVATE_IP=\"$PRIVATE_IP\"" >>mtconfig.conf
+#Setup firewall
+echo "Setting firewalld rules"
+if [[ $distro =~ "CentOS" ]]; then
+	SETFIREWALL=true
+	if ! yum -q list installed firewalld &>/dev/null; then
+		echo ""
+		if [ "$AUTO" = true ]; then
+			OPTION="y"
+		else
+			read -r -p "Looks like \"firewalld\" is not installed Do you want to install it?(y/n) " -e -i "y" OPTION
+		fi
+		case $OPTION in
+		"y" | "Y")
+			yum -y install firewalld
+			systemctl enable firewalld
+			;;
+		*)
+			SETFIREWALL=false
+			;;
+		esac
+	fi
+	if [ "$SETFIREWALL" = true ]; then
+		systemctl start firewalld
+		firewall-cmd --zone=public --add-port="$PORT"/tcp
+		firewall-cmd --runtime-to-permanent
+	fi
+elif [[ $distro =~ "Ubuntu" ]]; then
+	if dpkg --get-selections | grep -q "^ufw[[:space:]]*install$" >/dev/null; then
+		ufw allow "$PORT"/tcp
+	else
+		if [ "$AUTO" = true ]; then
+			OPTION="y"
+		else
+			echo
+			read -r -p "Looks like \"UFW\"(Firewall) is not installed Do you want to install it?(y/n) " -e -i "y" OPTION
+		fi
+		case $OPTION in
+		"y" | "Y")
+			apt-get install ufw
+			ufw enable
+			ufw allow ssh
+			ufw allow "$PORT"/tcp
+			;;
+		esac
+	fi
+	#Use BBR on user will
+	if ! [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] && { [[ $(lsb_release -r -s) =~ "20" ]] || [[ $(lsb_release -r -s) =~ "19" ]] || [[ $(lsb_release -r -s) =~ "18" ]]; }; then
+		if [ "$AUTO" != true ]; then
+			echo
+			read -r -p "Do you want to use BBR? BBR might help your proxy run faster.(y/n) " -e -i "y" ENABLE_BBR
+		fi
+		case $ENABLE_BBR in
+		"y" | "Y")
+			echo 'net.core.default_qdisc=fq' | tee -a /etc/sysctl.conf
+			echo 'net.ipv4.tcp_congestion_control=bbr' | tee -a /etc/sysctl.conf
+			sysctl -p
+			;;
+		esac
+	fi
+elif [[ $distro =~ "Debian" ]]; then
+	apt-get install -y iptables iptables-persistent
+	iptables -A INPUT -p tcp --dport "$PORT" --jump ACCEPT
+	iptables-save >/etc/iptables/rules.v4
+fi
+#Setup service files
+cd /etc/systemd/system || exit 2
+GenerateService
+echo "$SERVICE_STR" >MTProxy.service
+systemctl daemon-reload
+systemctl start MTProxy
+systemctl is-active --quiet MTProxy #Check if service is active
+SERVICE_STATUS=$?
+if [ $SERVICE_STATUS -ne 0 ]; then
+	echo "$(tput setaf 3)Warning: $(tput sgr 0)Building looks successful but the sevice is not running."
+	echo "Check status with \"systemctl status MTProxy\""
+fi
+systemctl enable MTProxy
+#Setup cornjob
+if [ "$ENABLE_UPDATER" = "y" ] || [ "$ENABLE_UPDATER" = "Y" ]; then
+	echo '#!/bin/bash
 systemctl stop MTProxy
 cd /opt/MTProxy/objs/bin
-
-if curl -sf https://core.telegram.org/getProxySecret -o proxy-secret.tmp; then
-    mv proxy-secret.tmp proxy-secret
+curl -s https://core.telegram.org/getProxySecret -o proxy-secret1
+STATUS_SECRET=$?
+if [ $STATUS_SECRET -eq 0 ]; then
+  cp proxy-secret1 proxy-secret
 fi
-
-if curl -sf https://core.telegram.org/getProxyConfig -o proxy-multi.conf.tmp; then
-    mv proxy-multi.conf.tmp proxy-multi.conf
+rm proxy-secret1
+curl -s https://core.telegram.org/getProxyConfig -o proxy-multi.conf1
+STATUS_CONF=$?
+if [ $STATUS_CONF -eq 0 ]; then
+  cp proxy-multi.conf1 proxy-multi.conf
 fi
-
+rm proxy-multi.conf1
 systemctl start MTProxy
-echo "Updated at $(date)" >> /var/log/mtproxy-updater.log
-EOF
-    
-    chmod +x "${MT_PROXY_DIR}/objs/bin/updater.sh"
-    
-    # Add to crontab
-    (crontab -l 2>/dev/null | grep -v "updater.sh"; echo "0 3 * * * ${MT_PROXY_DIR}/objs/bin/updater.sh") | crontab -
-    
-    log_success "Automatic updater configured"
-}
-
-generate_links() {
-    log_info "Generating proxy links..."
-    
-    local public_ip="$PUBLIC_IP"
-    if [[ "$public_ip" == "YOUR_IP" ]]; then
-        public_ip=$(get_public_ip)
-    fi
-    
-    local hex_domain=""
-    if [[ -n "$TLS_DOMAIN" ]]; then
-        hex_domain=$(printf "%s" "$TLS_DOMAIN" | xxd -pu | tr -d '\n' | tr '[:upper:]' '[:lower:]')
-    fi
-    
-    echo
-    echo "=== Proxy Connection Links ==="
-    
-    for secret in "${SECRET_ARRAY[@]}"; do
-        if [[ -z "$TLS_DOMAIN" ]]; then
-            echo "tg://proxy?server=${public_ip}&port=${PORT}&secret=dd${secret}"
-        else
-            echo "tg://proxy?server=${public_ip}&port=${PORT}&secret=ee${secret}${hex_domain}"
-        fi
-    done
-    echo
-}
-
-# Interactive setup
-interactive_setup() {
-    log_info "Starting interactive MTProxy setup..."
-    
-    # Port selection
-    while true; do
-        read -rp "Enter proxy port (1-65535, -1 for random): " -e -i "443" input_port
-        if [[ "$input_port" == "-1" ]]; then
-            PORT=$(get_random_port)
-            log_info "Selected random port: $PORT"
-            break
-        elif validate_port "$input_port"; then
-            PORT="$input_port"
-            break
-        fi
-    done
-    
-    # Secret setup
-    while true; do
-        echo
-        echo "Secret options:"
-        echo "1) Enter secret manually"
-        echo "2) Generate random secret"
-        read -rp "Choose option [1-2]: " -e -i "2" secret_option
-        
-        case "$secret_option" in
-            1)
-                read -rp "Enter 32-character hexadecimal secret: " secret
-                if validate_secret "$secret"; then
-                    SECRET_ARRAY+=("$secret")
-                    break
-                fi
-                ;;
-            2)
-                secret=$(openssl rand -hex 16 2>/dev/null || hexdump -vn 16 -e '/1 "%02x"' /dev/urandom)
-                SECRET_ARRAY+=("$secret")
-                log_success "Generated secret: $secret"
-                break
-                ;;
-            *)
-                log_error "Invalid option"
-                ;;
-        esac
-    done
-    
-    # Additional secrets
-    while true; do
-        if [[ ${#SECRET_ARRAY[@]} -ge 16 ]]; then
-            log_warning "Maximum 16 secrets reached"
-            break
-        fi
-        
-        read -rp "Add another secret? [y/N]: " add_more
-        case "$add_more" in
-            [yY]*)
-                secret=$(openssl rand -hex 16 2>/dev/null || hexdump -vn 16 -e '/1 "%02x"' /dev/urandom)
-                SECRET_ARRAY+=("$secret")
-                log_success "Generated additional secret: $secret"
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-    
-    # TAG setup
-    read -rp "Enter advertising TAG (from @MTProxybot, leave empty to skip): " TAG
-    
-    # CPU cores
-    local available_cores=$(nproc)
-    while true; do
-        read -rp "Number of worker processes (1-16, recommended: $available_cores): " -e -i "$available_cores" cores
-        if [[ "$cores" =~ ^[0-9]+$ ]] && (( cores >= 1 && cores <= 16 )); then
-            CPU_CORES="$cores"
-            break
-        else
-            log_error "Enter a number between 1 and 16"
-        fi
-    done
-    
-    # TLS domain
-    read -rp "Enter TLS domain (for Fake-TLS, leave empty to disable): " -e -i "www.cloudflare.com" TLS_DOMAIN
-    
-    # NAT configuration
-    HAVE_NAT=$(check_nat)
-    read -rp "Is server behind NAT? [y/N]: " -e -i "$HAVE_NAT" nat_input
-    HAVE_NAT="${nat_input:-$HAVE_NAT}"
-    
-    if [[ "$HAVE_NAT" =~ ^[yY] ]]; then
-        PUBLIC_IP=$(get_public_ip)
-        PRIVATE_IP=$(get_private_ip)
-        read -rp "Public IP: " -e -i "$PUBLIC_IP" PUBLIC_IP
-        read -rp "Private IP: " -e -i "$PRIVATE_IP" PRIVATE_IP
-    fi
-    
-    # Monitoring configuration
-    echo
-    log_info "Resource Monitoring Configuration"
-    read -rp "Enable automatic monitoring and recovery? [Y/n]: " monitor_input
-    ENABLE_MONITORING="${monitor_input:-y}"
-    
-    if [[ "$ENABLE_MONITORING" =~ ^[yY] ]]; then
-        read -rp "Maximum PIDs allowed [1000]: " max_pids
-        MAX_PIDS="${max_pids:-1000}"
-        
-        read -rp "Maximum memory usage % [80]: " max_mem
-        MAX_MEMORY_PERCENT="${max_mem:-80}"
-        
-        read -rp "Maximum CPU usage % [90]: " max_cpu
-        MAX_CPU_PERCENT="${max_cpu:-90}"
-        
-        read -rp "Check interval in seconds [300]: " interval
-        CHECK_INTERVAL="${interval:-300}"
-    fi
-    
-    # Custom arguments
-    read -rp "Enter custom arguments (leave empty if unsure): " CUSTOM_ARGS
-    
-    # Final confirmation
-    echo
-    log_warning "About to install MTProxy with the following configuration:"
-    echo "Port: $PORT"
-    echo "Secrets: ${#SECRET_ARRAY[@]} configured"
-    echo "Workers: $CPU_CORES"
-    echo "TLS Domain: ${TLS_DOMAIN:-Disabled}"
-    echo "NAT: $HAVE_NAT"
-    echo "Monitoring: $ENABLE_MONITORING"
-    if [[ "$ENABLE_MONITORING" == "y" ]]; then
-        echo "Max PIDs: $MAX_PIDS"
-        echo "Max Memory: $MAX_MEMORY_PERCENT%"
-        echo "Max CPU: $MAX_CPU_PERCENT%"
-    fi
-    echo
-    read -rp "Continue with installation? [Y/n]: " confirm
-    [[ "$confirm" =~ ^[nN] ]] && exit 0
-}
-
-# Main installation function
-main_installation() {
-    local distro=$(get_distribution)
-    
-    if [[ "$distro" == "Unknown" ]]; then
-        log_error "Unsupported Linux distribution"
-        exit 1
-    fi
-    
-    if ! is_root; then
-        log_error "This script must be run as root"
-        exit 1
-    fi
-    
-    # Interactive setup if not auto-install
-    if ! $AUTO_INSTALL; then
-        interactive_setup
-    fi
-    
-    # Set default values if not set
-    : "${PUBLIC_IP:=$(get_public_ip)}"
-    : "${PRIVATE_IP:=$(get_private_ip)}"
-    : "${CPU_CORES:=$(nproc)}"
-    : "${HAVE_NAT:=$(check_nat)}"
-    
-    # Install dependencies
-    install_dependencies "$distro"
-    
-    # Install MTProxy
-    install_mtproxy
-    
-    # Download configurations
-    download_configs
-    
-    # Create config file
-    create_config_file
-    
-    # Generate service file
-    generate_service_file
-    
-    # Configure firewall
-    configure_firewall "$PORT" "$distro"
-    
-    # Enable BBR
-    enable_bbr "$distro"
-    
-    # Setup service
-    setup_service
-    
-    # Setup updater
-    setup_updater
-    
-    # Setup monitoring
-    setup_monitoring
-    
-    # Generate links
-    generate_links
-    
-    log_success "MTProxy installation completed successfully!"
-    log_info "Configuration file: $CONFIG_FILE"
-    log_info "Service control: systemctl {start|stop|status} MTProxy"
-    if [[ "$ENABLE_MONITORING" == "y" ]]; then
-        log_info "Monitor service: systemctl {start|stop|status} mtproxy-monitor"
-        log_info "Monitor log: $MONITOR_LOG"
-    fi
-}
-
-# Management functions
-show_links() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        log_error "MTProxy not installed"
-        exit 1
-    fi
-    
-    source "$CONFIG_FILE" 2>/dev/null || {
-        log_error "Failed to load configuration"
-        exit 1
-    }
-    generate_links
-}
-
-show_status() {
-    log_info "MTProxy Service Status:"
-    systemctl status MTProxy --no-pager -l
-    
-    if [[ -f "$MONITOR_SERVICE" ]]; then
-        echo
-        log_info "Monitor Service Status:"
-        systemctl status mtproxy-monitor --no-pager -l
-        
-        echo
-        log_info "Recent Monitor Log:"
-        tail -20 "$MONITOR_LOG" 2>/dev/null || echo "No monitor log found"
-    fi
-    
-    echo
-    log_info "Resource Usage:"
-    echo "PIDs: $(get_service_pids)/${MAX_PIDS}"
-    echo "Memory: $(get_service_memory)%/${MAX_MEMORY_PERCENT}%"
-    echo "CPU: $(get_service_cpu)%/${MAX_CPU_PERCENT}%"
-}
-
-uninstall_proxy() {
-    log_warning "This will completely remove MTProxy and all its components"
-    read -rp "Are you sure? [y/N]: " confirm
-    [[ ! "$confirm" =~ ^[yY] ]] && exit 0
-    
-    # Stop services
-    systemctl stop MTProxy 2>/dev/null || true
-    systemctl stop mtproxy-monitor 2>/dev/null || true
-    
-    # Disable services
-    systemctl disable MTProxy 2>/dev/null || true
-    systemctl disable mtproxy-monitor 2>/dev/null || true
-    
-    # Remove service files
-    rm -f "$SERVICE_FILE"
-    rm -f "$MONITOR_SERVICE"
-    systemctl daemon-reload
-    
-    # Remove firewall rules
-    local distro=$(get_distribution)
-    local port=$(source "$CONFIG_FILE" 2>/dev/null && echo "$PORT" || echo "443")
-    
-    case "$distro" in
-        "CentOS") 
-            firewall-cmd --remove-port="${port}/tcp" --permanent 2>/dev/null || true
-            firewall-cmd --reload 2>/dev/null || true
-            ;;
-        "Ubuntu") 
-            ufw delete allow "${port}/tcp" 2>/dev/null || true
-            ;;
-        "Debian") 
-            iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            ;;
-    esac
-    
-    # Remove files
-    rm -rf "$MT_PROXY_DIR"
-    rm -f "$MONITOR_SCRIPT"
-    rm -rf /etc/mtproxy
-    rm -f "$MONITOR_LOG"
-    rm -f /var/log/mtproxy-updater.log
-    
-    # Remove crontab entries
-    crontab -l 2>/dev/null | grep -v "mtproxy\|updater.sh" | crontab -
-    
-    log_success "MTProxy completely uninstalled"
-}
-
-show_usage() {
-    cat << EOF
-$SCRIPT_NAME v$SCRIPT_VERSION
-
-Usage: $0 [options]
-
-Options:
-  -h, --help            Show this help message
-  -p, --port PORT       Set proxy port
-  -s, --secret SECRET   Add a secret (can be used multiple times)
-  -t, --tag TAG         Set advertising tag
-  --workers N           Number of worker processes
-  --tls-domain DOMAIN   Set TLS domain for Fake-TLS
-  --no-updater          Disable automatic updates
-  --no-bbr              Disable BBR congestion control
-  --enable-monitoring   Enable resource monitoring
-  --disable-monitoring  Disable resource monitoring
-  --max-pids NUM        Set maximum PIDs for monitoring
-  --check-interval SEC  Set monitoring check interval
-
-Management commands:
-  show-links            Show proxy connection links
-  show-status           Show service status and resource usage
-  uninstall             Uninstall MTProxy completely
-
-Examples:
-  $0                    # Interactive installation
-  $0 --port 443 --secret abc123... --workers 4 --enable-monitoring
-  $0 show-links         # Show connection links
-  $0 show-status        # Show current status
-  $0 uninstall          # Uninstall MTProxy
-EOF
-}
-
-# Parse command line arguments
-parse_arguments() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            show-links)
-                show_links
-                exit 0
-                ;;
-            show-status)
-                show_status
-                exit 0
-                ;;
-            uninstall)
-                uninstall_proxy
-                exit 0
-                ;;
-            -p|--port)
-                validate_port "$2" || exit 1
-                PORT="$2"
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            -s|--secret)
-                validate_secret "$2" || exit 1
-                SECRET_ARRAY+=("$2")
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            -t|--tag)
-                TAG="$2"
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            --workers)
-                if [[ "$2" =~ ^[0-9]+$ ]] && (( "$2" >= 1 && "$2" <= 16 )); then
-                    CPU_CORES="$2"
-                else
-                    log_error "Workers must be between 1 and 16"
-                    exit 1
-                fi
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            --tls-domain)
-                TLS_DOMAIN="$2"
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            --no-updater)
-                ENABLE_UPDATER="n"
-                AUTO_INSTALL=true
-                shift
-                ;;
-            --no-bbr)
-                ENABLE_BBR="n"
-                AUTO_INSTALL=true
-                shift
-                ;;
-            --enable-monitoring)
-                ENABLE_MONITORING="y"
-                AUTO_INSTALL=true
-                shift
-                ;;
-            --disable-monitoring)
-                ENABLE_MONITORING="n"
-                AUTO_INSTALL=true
-                shift
-                ;;
-            --max-pids)
-                if [[ "$2" =~ ^[0-9]+$ ]] && (( "$2" >= 100 )); then
-                    MAX_PIDS="$2"
-                else
-                    log_error "Max PIDs must be at least 100"
-                    exit 1
-                fi
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            --check-interval)
-                if [[ "$2" =~ ^[0-9]+$ ]] && (( "$2" >= 60 )); then
-                    CHECK_INTERVAL="$2"
-                else
-                    log_error "Check interval must be at least 60 seconds"
-                    exit 1
-                fi
-                AUTO_INSTALL=true
-                shift 2
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
-        esac
-    done
-}
-
-# Main execution
-main() {
-    parse_arguments "$@"
-    
-    if [[ -d "$MT_PROXY_DIR" ]] && ! $AUTO_INSTALL; then
-        log_info "MTProxy is already installed"
-        echo "1) Show connection links"
-        echo "2) Show status"
-        echo "3) Uninstall"
-        echo "4) Exit"
-        read -rp "Choose option [1-4]: " option
-        
-        case "$option" in
-            1) show_links ;;
-            2) show_status ;;
-            3) uninstall_proxy ;;
-            *) exit 0 ;;
-        esac
-    else
-        main_installation
-    fi
-}
-
-# Run main function with all arguments
-main "$@"
+echo "Updater runned at $(date). Exit codes of getProxySecret and getProxyConfig are $STATUS_SECRET and $STATUS_CONF" >> updater.log' >/opt/MTProxy/objs/bin/updater.sh
+	echo "" >>/etc/crontab
+	echo "0 0 * * * root cd /opt/MTProxy/objs/bin && bash updater.sh" >>/etc/crontab
+	if [[ $distro =~ "CentOS" ]]; then
+		systemctl restart crond
+	elif [[ $distro =~ "Ubuntu" ]] || [[ $distro =~ "Debian" ]]; then
+		systemctl restart cron
+	fi
+fi
+#Show proxy links
+tput setaf 3
+printf "%$(tput cols)s" | tr ' ' '#'
+tput sgr 0
+echo "These are the links for proxy:"
+PUBLIC_IP="$(curl https://api.ipify.org -sS)"
+CURL_EXIT_STATUS=$?
+[ $CURL_EXIT_STATUS -ne 0 ] && PUBLIC_IP="YOUR_IP"
+HEX_DOMAIN=$(printf "%s" "$TLS_DOMAIN" | xxd -pu)
+HEX_DOMAIN="$(echo $HEX_DOMAIN | tr '[A-Z]' '[a-z]')"
+for i in "${SECRET_ARY[@]}"; do
+	if [ -z "$TLS_DOMAIN" ]; then
+		echo "tg://proxy?server=$PUBLIC_IP&port=$PORT&secret=dd$i"
+	else
+		echo "tg://proxy?server=$PUBLIC_IP&port=$PORT&secret=ee$i$HEX_DOMAIN"
+	fi
+done
