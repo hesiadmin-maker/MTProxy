@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Constants
-readonly SCRIPT_NAME="MTProxy Installer"
+readonly SCRIPT_NAME="MTProxy Auto-Healing Installer"
 readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly MT_PROXY_DIR="/opt/MTProxy"
@@ -96,7 +96,7 @@ get_random_port() {
     local port
     while true; do
         port=$((RANDOM % 16383 + 49152))
-        if ! command -v lsof &>/dev/null || ! lsof -Pi :"$port" -sTCP:LISTEN -t >/dev/null; then
+        if ! command -v nc &>/dev/null || ! nc -z localhost "$port" &>/dev/null; then
             echo "$port"
             break
         fi
@@ -131,13 +131,13 @@ get_service_pids() {
 
 get_service_memory() {
     local memory_percent
-    memory_percent=$(ps -C mtproto-proxy -o %mem --no-headers | awk '{sum+=$1} END {print sum}' 2>/dev/null || echo "0")
+    memory_percent=$(ps -C mtproto-proxy -o %mem --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0")
     echo "${memory_percent%.*}"
 }
 
 get_service_cpu() {
     local cpu_percent
-    cpu_percent=$(ps -C mtproto-proxy -o %cpu --no-headers | awk '{sum+=$1} END {print sum}' 2>/dev/null || echo "0")
+    cpu_percent=$(ps -C mtproto-proxy -o %cpu --no-headers 2>/dev/null | awk '{sum+=$1} END {print sum+0}' || echo "0")
     echo "${cpu_percent%.*}"
 }
 
@@ -342,12 +342,11 @@ install_dependencies() {
     case "$distro" in
         "CentOS")
             yum -y install epel-release
-            yum -y install openssl-devel zlib-devel curl ca-certificates sed cronie vim-common git curl build-essential libssl-dev zlib1g-dev
-            yum -y groupinstall "Development Tools"
+            yum -y install openssl-devel zlib-devel curl ca-certificates sed cronie vim-common git curl gcc make
             ;;
         "Ubuntu"|"Debian")
             apt-get update
-            apt-get -y install git curl build-essential libssl-dev zlib1g-dev sed cron ca-certificates vim-common
+            apt-get -y install git curl build-essential libssl-dev zlib1g-dev sed cron ca-certificates
             ;;
         *)
             log_error "Unsupported distribution: $distro"
@@ -370,7 +369,6 @@ install_mtproxy() {
     
     if ! make; then
         log_error "Failed to build MTProxy"
-        rm -rf "$MT_PROXY_DIR"
         exit 1
     fi
     
@@ -383,11 +381,15 @@ download_configs() {
     cd "${MT_PROXY_DIR}/objs/bin" || exit 1
     
     if ! curl -sf https://core.telegram.org/getProxySecret -o proxy-secret; then
-        log_warning "Failed to download proxy-secret"
+        log_error "Failed to download proxy-secret"
+    else
+        log_success "Proxy secret downloaded"
     fi
     
     if ! curl -sf https://core.telegram.org/getProxyConfig -o proxy-multi.conf; then
-        log_warning "Failed to download proxy-multi.conf"
+        log_error "Failed to download proxy-multi.conf"
+    else
+        log_success "Proxy config downloaded"
     fi
 }
 
@@ -402,6 +404,7 @@ configure_firewall() {
             if command -v firewall-cmd &>/dev/null; then
                 firewall-cmd --zone=public --add-port="${port}/tcp" --permanent
                 firewall-cmd --reload
+                log_success "Firewall configured for port $port"
             else
                 log_warning "firewalld not installed. Skipping firewall configuration."
             fi
@@ -409,6 +412,7 @@ configure_firewall() {
         "Ubuntu")
             if command -v ufw &>/dev/null; then
                 ufw allow "${port}/tcp"
+                log_success "Firewall configured for port $port"
             else
                 log_warning "UFW not installed. Skipping firewall configuration."
             fi
@@ -417,6 +421,7 @@ configure_firewall() {
             iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
             if command -v iptables-save &>/dev/null; then
                 iptables-save > /etc/iptables/rules.v4
+                log_success "Firewall configured for port $port"
             fi
             ;;
     esac
@@ -438,7 +443,10 @@ enable_bbr() {
         if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
             echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
         fi
-        sysctl -p
+        sysctl -p >/dev/null 2>&1
+        log_success "BBR enabled"
+    else
+        log_warning "BBR auto-configuration not supported on $distro"
     fi
 }
 
@@ -505,20 +513,17 @@ setup_service() {
     systemctl daemon-reload
     systemctl enable MTProxy
     
-    # Start service initially
     if ! systemctl start MTProxy; then
         log_error "Failed to start MTProxy service"
         systemctl status MTProxy
         return 1
     fi
     
-    # Wait a bit and check status
     sleep 5
     if systemctl is-active --quiet MTProxy; then
         log_success "MTProxy service started successfully"
     else
         log_error "MTProxy service failed to start"
-        systemctl status MTProxy
         return 1
     fi
 }
@@ -546,7 +551,7 @@ if curl -sf https://core.telegram.org/getProxyConfig -o proxy-multi.conf.tmp; th
 fi
 
 systemctl start MTProxy
-echo "Updated at $(date)" >> updater.log
+echo "Updated at $(date)" >> /var/log/mtproxy-updater.log
 EOF
     
     chmod +x "${MT_PROXY_DIR}/objs/bin/updater.sh"
@@ -863,6 +868,7 @@ uninstall_proxy() {
     rm -f "$MONITOR_SCRIPT"
     rm -rf /etc/mtproxy
     rm -f "$MONITOR_LOG"
+    rm -f /var/log/mtproxy-updater.log
     
     # Remove crontab entries
     crontab -l 2>/dev/null | grep -v "mtproxy\|updater.sh" | crontab -
