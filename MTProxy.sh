@@ -5,7 +5,14 @@ set -euo pipefail
 # Constants
 readonly SCRIPT_NAME="MTProxy Auto-Healing Installer"
 readonly SCRIPT_VERSION="2.1.0"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Fix for BASH_SOURCE issue when piped to bash
+if [[ "${BASH_SOURCE[0]:-}" ]]; then
+    readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    readonly SCRIPT_DIR="$(pwd)"
+fi
+
 readonly MT_PROXY_DIR="/opt/MTProxy"
 readonly CONFIG_FILE="${MT_PROXY_DIR}/objs/bin/mtconfig.conf"
 readonly SERVICE_FILE="/etc/systemd/system/MTProxy.service"
