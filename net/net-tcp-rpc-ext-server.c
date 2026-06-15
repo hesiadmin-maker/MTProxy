@@ -352,8 +352,11 @@ static unsigned char *create_request (const char *domain) {
   add_random (result, &pos, 32);
   add_string (result, &pos, "\x00\x22", 2);
   add_grease (result, &pos, greases, 0);
+
+  /* ===== ORIGINAL CIPHER SUITES (36 bytes) ===== */
   add_string (result, &pos, "\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9\xcc\xa8"
-                            "\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x00\x0a\x01\x00", 34);
+                            "\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x00\x0a\x01\x00\x01\x91", 36);
+
   add_grease (result, &pos, greases, 2);
   add_string (result, &pos, "\x00\x00\x00\x00", 4);
   add_length (result, &pos, domain_length + 5);
@@ -361,8 +364,12 @@ static unsigned char *create_request (const char *domain) {
   add_string (result, &pos, "\x00", 1);
   add_length (result, &pos, domain_length);
   add_string (result, &pos, domain, domain_length);
+
+  /* ===== ORIGINAL SESSION TICKET + GREASE (NO PADDING) ===== */
   add_string (result, &pos, "\x00\x17\x00\x00\xff\x01\x00\x01\x00\x00\x0a\x00\x0a\x00\x08", 15);
   add_grease (result, &pos, greases, 4);
+
+  /* ===== CHROME 124 ALPN: h2, http/1.1 ===== */
   add_string (result, &pos, "\x00\x1d\x00\x17\x00\x18\x00\x0b\x00\x02\x01\x00\x00\x23\x00\x00\x00\x10"
                             "\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31\x00\x05"
                             "\x00\x05\x01\x00\x00\x00\x00\x00\x0d\x00\x14\x00\x12\x04\x03\x08\x04\x04"
