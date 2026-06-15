@@ -155,6 +155,10 @@ void tcp_rpcs_set_ext_secret (unsigned char secret[16]) {
   memcpy (ext_secret[ext_secret_cnt ++], secret, 16);
 }
 
+void tcp_rpcs_set_ext_rand_pad_only (int set) {
+  vkprintf (1, "tcp_rpcs_set_ext_rand_pad_only(%d)\n", set);
+}
+
 static int allow_only_tls;
 
 struct domain_info {
@@ -204,7 +208,6 @@ static int get_domain_server_hello_encrypted_size (const struct domain_info *inf
 #define TLS_REQUEST_LENGTH 517
 
 static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
-  // returns y^2 = x^3 + 486662 * x^2 + x
   BIGNUM *y = BN_dup (x);
   assert (y != NULL);
   BIGNUM *coef = BN_new();
@@ -219,7 +222,6 @@ static BIGNUM *get_y2 (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
 }
 
 static BIGNUM *get_double_x (BIGNUM *x, const BIGNUM *mod, BN_CTX *big_num_context) {
-  // returns x_2 = (x^2 - 1)^2/(4*y^2)
   BIGNUM *denominator = get_y2 (x, mod, big_num_context);
   assert (denominator != NULL);
   BIGNUM *coef = BN_new();
@@ -775,7 +777,6 @@ static const struct domain_info *get_sni_domain_info (const unsigned char *reque
     CHECK_LENGTH(extension_length);
 
     if (extension_id == 0) {
-      // found SNI
       CHECK_LENGTH(5);
       int inner_length = read_length (request, &pos);
       if (inner_length != extension_length - 2) {
@@ -830,7 +831,6 @@ void tcp_rpc_init_proxy_domains() {
     while (info != NULL) {
       if (!update_domain_info (info)) {
         kprintf ("Failed to update response data about %s, so default response settings wiil be used\n", info->domain);
-        // keep target addresses as is
         info->is_reversed_extension_order = 0;
         info->use_random_encrypted_size = 1;
         info->server_hello_encrypted_size = 2500 + rand() % 1120;
@@ -922,32 +922,21 @@ static void delete_old_client_randoms() {
 
 static int is_allowed_timestamp (int timestamp) {
   if (timestamp > now + 3) {
-    // do not allow timestamps in the future
-    // after time synchronization client should always have time in the past
     vkprintf (1, "Disallow request with timestamp %d from the future, now is %d\n", timestamp, now);
     return 0;
   }
 
-  // first_client_random->time is an exact time when corresponding request was received
-  // if the timestamp is bigger than (first_client_random->time + 3), then the current request could be accepted
-  // only after the request with first_client_random, so the client random still must be cached
-  // if the request wasn't accepted, then the client_random still will be cached for MAX_CLIENT_RANDOM_CACHE_TIME seconds,
-  // so we can miss duplicate request only after a lot of time has passed
   if (first_client_random != NULL && timestamp > first_client_random->time + 3) {
     vkprintf (1, "Allow new request with timestamp %d\n", timestamp);
     return 1;
   }
 
-  // allow all requests with timestamp recently in past, regardless of ability to check repeating client random
-  // the allowed error must be big enough to allow requests after time synchronization
   const int MAX_ALLOWED_TIMESTAMP_ERROR = 10 * 60;
   if (timestamp > now - MAX_ALLOWED_TIMESTAMP_ERROR) {
-    // this can happen only first (MAX_ALLOWED_TIMESTAMP_ERROR + 3) sceonds after first_client_random->time
     vkprintf (1, "Allow recent request with timestamp %d without full check for client random duplication\n", timestamp);
     return 1;
   }
 
-  // the request is too old to check client random, do not allow it to force client to synchronize it's time
   vkprintf (1, "Disallow too old request with timestamp %d\n", timestamp);
   return 0;
 }
@@ -1077,7 +1066,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         continue;
       }
         
-      // http
       if ((packet_len == *(int *)"HEAD" || packet_len == *(int *)"POST" || packet_len == *(int *)"GET " || packet_len == *(int *)"OPTI") && TCP_RPCS_FUNC(C)->http_fallback_type) {
         D->crypto_flags |= RPCF_COMPACT_OFF;
         vkprintf (1, "HTTP type\n");
@@ -1085,7 +1073,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       }
 #endif
 
-      // fake tls
       if (c->flags & C_IS_TLS) {
         if (len < 11) {
           return 11 - len;
@@ -1108,7 +1095,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
         assert (rwm_skip_data (&c->in, 11) == 11);
         len -= 11;
-        c->left_tls_packet_length = 256 * header[9] + header[10]; // store left length of current TLS packet in extra_int3
+        c->left_tls_packet_length = 256 * header[9] + header[10];
         vkprintf (2, "Receive first TLS packet of length %d\n", c->left_tls_packet_length);
 
         if (c->left_tls_packet_length < 64) {
@@ -1116,11 +1103,10 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           fail_connection (C, -1);
           return 0;
         }
-        // now len >= c->left_tls_packet_length >= 64
 
         assert (rwm_fetch_lookup (&c->in, &packet_len, 4) == 4);
 
-        c->left_tls_packet_length -= 64; // skip header length
+        c->left_tls_packet_length -= 64;
       } else if (packet_len == *(int *)"\x16\x03\x01\x02" && ext_secret_cnt > 0 && allow_only_tls) {
         unsigned char header[5];
         assert (rwm_fetch_lookup (&c->in, header, 5) == 5);
@@ -1130,7 +1116,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         }
 
         int read_len = len <= 4096 ? len : 4096;
-        unsigned char client_hello[read_len + 1]; // VLA
+        unsigned char client_hello[read_len + 1];
         assert (rwm_fetch_lookup (&c->in, client_hello, read_len) == read_len);
 
         const struct domain_info *info = get_sni_domain_info (client_hello, read_len);
@@ -1189,7 +1175,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           RETURN_TLS_ERROR(info);
         }
         while (cipher_suites_length >= 2 && (client_hello[pos] & 0x0F) == 0x0A && (client_hello[pos + 1] & 0x0F) == 0x0A) {
-          // skip grease
           cipher_suites_length -= 2;
           pos += 2;
         }
@@ -1263,7 +1248,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         job_signal (JOB_REF_CREATE_PASS (C), JS_RUN);
 
         free (buffer);
-        return 11; // waiting for dummy ChangeCipherSpec and first packet
+        return 11;
       }
 
       if (allow_only_tls && !(c->flags & C_IS_TLS)) {
@@ -1340,7 +1325,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           assert (rwm_skip_data (&c->in, 64) == 64);
           rwm_union (&c->in_u, &c->in);
           rwm_init (&c->in, 0);
-          // T->read_pos = 64;
           D->in_packet_num = 0;
           switch (tag) {
             case 0xeeeeeeee:
@@ -1391,13 +1375,9 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
     int packet_len_bytes = 4;
     if (D->flags & RPC_F_MEDIUM) {
-      // packet len in `medium` mode
-      //if (D->crypto_flags & RPCF_QUICKACK) {
-        D->flags = (D->flags & ~RPC_F_QUICKACK) | (packet_len & RPC_F_QUICKACK);
-        packet_len &= ~RPC_F_QUICKACK;
-      //}
+      D->flags = (D->flags & ~RPC_F_QUICKACK) | (packet_len & RPC_F_QUICKACK);
+      packet_len &= ~RPC_F_QUICKACK;
     } else {
-      // packet len in `compact` mode
       if (packet_len & 0x80) {
         D->flags |= RPC_F_QUICKACK;
         packet_len &= ~0x80;
@@ -1458,7 +1438,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
     int res = -1;
 
-    /* main case */
     c->last_response_time = precise_now;
     if (packet_type == RPC_PING) {
       res = tcp_rpcs_default_execute (C, packet_type, &msg);
