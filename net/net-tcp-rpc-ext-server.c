@@ -102,7 +102,6 @@ conn_type_t ct_proxy_pass = {
   .connected = tcp_proxy_pass_connected,
   .close = tcp_proxy_pass_close,
   .write_packet = tcp_proxy_pass_write_packet,
-  .connected = server_noop,
 };
 
 int tcp_proxy_pass_connected (connection_job_t C) {
