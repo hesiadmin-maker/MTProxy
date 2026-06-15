@@ -352,11 +352,8 @@ static unsigned char *create_request (const char *domain) {
   add_random (result, &pos, 32);
   add_string (result, &pos, "\x00\x22", 2);
   add_grease (result, &pos, greases, 0);
-
-  /* ===== CHROME 124 CIPHER SUITES ===== */
   add_string (result, &pos, "\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9\xcc\xa8"
                             "\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x00\x0a\x01\x00", 34);
-
   add_grease (result, &pos, greases, 2);
   add_string (result, &pos, "\x00\x00\x00\x00", 4);
   add_length (result, &pos, domain_length + 5);
@@ -364,21 +361,8 @@ static unsigned char *create_request (const char *domain) {
   add_string (result, &pos, "\x00", 1);
   add_length (result, &pos, domain_length);
   add_string (result, &pos, domain, domain_length);
-
-  /* ===== CHROME 124: Session Ticket = off, GREASE, Padding ===== */
-  add_string (result, &pos, "\x00\x17\x00\x00", 4);
-  add_string (result, &pos, "\xff\x01\x00\x01\x00\x00\x0a\x00\x0a\x00\x08", 11);
+  add_string (result, &pos, "\x00\x17\x00\x00\xff\x01\x00\x01\x00\x00\x0a\x00\x0a\x00\x08", 15);
   add_grease (result, &pos, greases, 4);
-
-  /* ===== CHROME 124 PADDING EXTENSION ===== */
-  {
-    int padding_len = 20 + (rand() % 100);
-    add_string (result, &pos, "\x00\x15", 2);
-    add_length (result, &pos, padding_len);
-    add_random (result, &pos, padding_len);
-  }
-
-  /* ===== CHROME 124 ALPN: h2, http/1.1 ===== */
   add_string (result, &pos, "\x00\x1d\x00\x17\x00\x18\x00\x0b\x00\x02\x01\x00\x00\x23\x00\x00\x00\x10"
                             "\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31\x2e\x31\x00\x05"
                             "\x00\x05\x01\x00\x00\x00\x00\x00\x0d\x00\x14\x00\x12\x04\x03\x08\x04\x04"
@@ -1195,17 +1179,13 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
         memcpy (buffer, client_random, 32);
         unsigned char *response_buffer = buffer + 32;
 
-        /* ===== CHROME 124 SERVER HELLO ===== */
         memcpy (response_buffer, "\x16\x03\x03\x00\x7a\x02\x00\x00\x76\x03\x03", 11);
         memset (response_buffer + 11, '\0', 32);
         response_buffer[43] = '\x20';
         memcpy (response_buffer + 44, client_hello + 44, 32);
-
-        /* ===== CHROME 124 CIPHER SUITE (TLS_AES_128_GCM_SHA256) ===== */
         memcpy (response_buffer + 76, "\x13\x01\x00\x00\x2e", 5);
         response_buffer[77] = cipher_suite_id;
 
-        /* ===== CHROME 124 EXTENSIONS ORDER: key_share (0x33), supported_versions (0x2b) ===== */
         pos = 81;
         int tls_server_extensions[3] = {0x33, 0x2b, -1};
         if (info->is_reversed_extension_order) {
@@ -1229,7 +1209,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           }
         }
 
-        /* ===== CHROME 124: NO SESSION TICKET OR SESSION CACHE ===== */
         assert (pos == 127);
         memcpy (response_buffer + 127, "\x14\x03\x03\x00\x01\x01\x17\x03\x03", 9);
         pos += 9;
