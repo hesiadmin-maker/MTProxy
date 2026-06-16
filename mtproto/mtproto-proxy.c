@@ -68,7 +68,7 @@
 #define COMMIT "unknown"
 #endif
 
-#define VERSION_STR	"mtproxy-3.0.5"
+#define VERSION_STR	"mtproxy-0.02"
 const char FullVersionStr[] = VERSION_STR " compiled at " __DATE__ " " __TIME__ " by gcc " __VERSION__ " "
 #ifdef __LP64__
   "64-bit"
@@ -109,8 +109,6 @@ const char FullVersionStr[] = VERSION_STR " compiled at " __DATE__ " " __TIME__ 
 
 static double ping_interval = PING_INTERVAL;
 static int window_clamp;
-static int pad_min = 0;
-static int pad_max = 0;
 
 #define	PROXY_MODE_OUT	2
 static int proxy_mode;
@@ -411,7 +409,6 @@ int worker_id, workers, slave_mode, parent_pid;
 int pids[MAX_WORKERS];
 
 long long get_queries;
-extern long long http_queries;
 int pending_http_queries;
 
 long long active_rpcs, active_rpcs_created;
@@ -1144,21 +1141,6 @@ char mtproto_cors_http_headers[] =
 int forward_mtproto_packet (struct tl_in_state *tlio_in, connection_job_t C, int len, int remote_ip_port[5], int rpc_flags);
 int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t C, conn_target_job_t S, int flags, long long auth_key_id, int remote_ip_port[5], int our_ip_port[5]);
 
-static void append_random_padding(struct tl_out_state *tlio_out, int min, int max) {
-    if (min <= 0 || max <= 0) return;
-    int pad_len = min + (lrand48() % (max - min + 1));
-    
-    // Adjust to maintain 4-byte alignment
-    pad_len = (pad_len + 3) & ~3;  // Round up to multiple of 4
-    
-    unsigned char pad[1024];
-    if (pad_len > sizeof(pad)) pad_len = sizeof(pad) & ~3;
-    if (pad_len > 0) {
-        RAND_bytes(pad, pad_len);
-        tl_store_raw_data(pad, pad_len);
-    }
-}
-
 unsigned parse_text_ipv4 (char *str) {
   int a, b, c, d;
   if (sscanf (str, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
@@ -1615,25 +1597,11 @@ int http_send_message (JOB_REF_ARG (C), struct tl_in_state *tlio_in, int flags) 
     D->query_flags &= ~QF_KEEPALIVE;
     write_http_error (C, -error_code);
   } else {
-    int data_len = TL_IN_REMAINING;
-    int pad_len = 0;
-    if (pad_max > 0) {
-        pad_len = pad_min + (lrand48() % (pad_max - pad_min + 1));
-        pad_len = (pad_len + 3) & ~3;  // Round to multiple of 4
-    }
-    int total_len = data_len + pad_len;
-    
     char response_buffer[512];
     TLS_START_UNALIGN (JOB_REF_CREATE_PASS (C)) {
-      int hlen = snprintf (response_buffer, sizeof(response_buffer)-1, "HTTP/1.1 200 OK\r\nConnection: %s\r\nContent-type: application/octet-stream\r\nPragma: no-cache\r\nCache-control: no-store\r\n%sContent-length: %d\r\n\r\n", (D->query_flags & QF_KEEPALIVE) ? "keep-alive" : "close", D->query_flags & QF_EXTRA_HEADERS ? mtproto_cors_http_headers : "", total_len);
-      tl_store_raw_data (response_buffer, hlen);
-      assert (tl_copy_through (tlio_in, tlio_out, data_len, 1) == data_len);
-      if (pad_len > 0) {
-          unsigned char pad[1024];
-          if (pad_len > sizeof(pad)) pad_len = sizeof(pad) & ~3;
-          RAND_bytes(pad, pad_len);
-          tl_store_raw_data(pad, pad_len);
-      }
+      int len = TL_IN_REMAINING;
+      tl_store_raw_data (response_buffer, snprintf (response_buffer, sizeof (response_buffer) - 1, "HTTP/1.1 200 OK\r\nConnection: %s\r\nContent-type: application/octet-stream\r\nPragma: no-cache\r\nCache-control: no-store\r\n%sContent-length: %d\r\n\r\n", (D->query_flags & QF_KEEPALIVE) ? "keep-alive" : "close", D->query_flags & QF_EXTRA_HEADERS ? mtproto_cors_http_headers : "", len));
+      assert (tl_copy_through (tlio_in, tlio_out, len, 1) == len);
     } TLS_END;
   }
 
@@ -1667,18 +1635,7 @@ int client_send_message (JOB_REF_ARG(C), long long in_conn_id, struct tl_in_stat
     return http_send_message (JOB_REF_PASS(C), tlio_in, flags);
   }
   TLS_START (JOB_REF_CREATE_PASS (C)) {
-    int data_len = TL_IN_REMAINING;
-    assert (tl_copy_through (tlio_in, tlio_out, data_len, 1) >= 0);
-    if (pad_max > 0) {
-        int pad_len = pad_min + (lrand48() % (pad_max - pad_min + 1));
-        pad_len = (pad_len + 3) & ~3;  // Round to multiple of 4
-        if (pad_len > 0) {
-            unsigned char pad[1024];
-            if (pad_len > sizeof(pad)) pad_len = sizeof(pad) & ~3;
-            RAND_bytes(pad, pad_len);
-            tl_store_raw_data(pad, pad_len);
-        }
-    }
+    assert (tl_copy_through (tlio_in, tlio_out, TL_IN_REMAINING, 1) >= 0);
   } TLS_END;
 
   if (check_conn_buffers (C) < 0) { 
@@ -2168,7 +2125,7 @@ void mtfront_sigusr1_handler (void) {
  */
 
 void usage (void) {
-  printf ("usage: %s [-v] [-6] [-p<port>] [-H<http-port>{,<http-port>}] [-M<workers>] [-u<username>] [-b<backlog>] [-c<max-conn>] [-l<log-name>] [-W<window-size>] [-Z<padding-min-max>] <config-file>\n", progname);
+  printf ("usage: %s [-v] [-6] [-p<port>] [-H<http-port>{,<http-port>}] [-M<workers>] [-u<username>] [-b<backlog>] [-c<max-conn>] [-l<log-name>] [-W<window-size>] <config-file>\n", progname);
   printf ("%s\n", FullVersionStr);
   printf ("\tSimple MT-Proto proxy\n");
   parse_usage ();
@@ -2188,22 +2145,6 @@ int f_parse_option (int val) {
   case 'W':
     window_clamp = atoi (optarg);
     break;
-  case 'Z':
-  {
-    char *dash = strchr(optarg, '-');
-    if (!dash) {
-        kprintf("Invalid padding range format. Use min-max.\n");
-        exit(1);
-    }
-    *dash = 0;
-    pad_min = atoi(optarg);
-    pad_max = atoi(dash+1);
-    if (pad_min < 0 || pad_max < pad_min || pad_max > 10000) {
-        kprintf("Invalid padding range. Must be 0 <= min <= max <= 10000.\n");
-        exit(1);
-    }
-    break;
-  }
   case 'H':
     ptr = optarg;
     if (!*ptr) {
@@ -2287,9 +2228,6 @@ int f_parse_option (int val) {
       }
     }
     break;
-  case 'R':
-    tcp_rpcs_set_ext_rand_pad_only(1);
-    break;
   default:
     return -1;
   }
@@ -2304,11 +2242,9 @@ void mtfront_prepare_parse_options (void) {
   parse_option ("max-special-connections", required_argument, 0, 'C', "sets maximal number of accepted client connections per worker");
   parse_option ("window-clamp", required_argument, 0, 'W', "sets window clamp for client TCP connections");
   parse_option ("http-ports", required_argument, 0, 'H', "comma-separated list of client (HTTP) ports to listen");
-  parse_option ("padding-size", required_argument, 0, 'Z', "set random padding range in bytes (min-max)");
   // parse_option ("outbound-connections-ps", required_argument, 0, 'o', "limits creation rate of outbound connections to mtproto-servers (default %d)", DEFAULT_OUTBOUND_CONNECTION_CREATION_RATE);
   parse_option ("slaves", required_argument, 0, 'M', "spawn several slave workers; not recommended for TLS-transport mode for better replay protection");
   parse_option ("ping-interval", required_argument, 0, 'T', "sets ping interval in second for local TCP connections (default %.3lf)", PING_INTERVAL);
-  parse_option ("random-padding-only", no_argument, 0, 'R', "allow only clients with random padding option enabled");
 }
 
 void mtfront_parse_extra_args (int argc, char *argv[]) /* {{{ */ {
@@ -2421,7 +2357,7 @@ server_functions_t mtproto_front_functions = {
   .parse_option = f_parse_option,
   .prepare_parse_options = mtfront_prepare_parse_options,
   .parse_extra_args = mtfront_parse_extra_args,
-  .epoll_timeout = 1000,
+  .epoll_timeout = 1,
   .FullVersionStr = FullVersionStr,
   .ShortVersionStr = "mtproxy",
   .parse_function = mtfront_parse_function,
